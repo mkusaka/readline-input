@@ -1,8 +1,16 @@
 import * as readline from 'readline';
+import OpenAI from 'openai';
+import * as dotenv from 'dotenv';
+
+dotenv.config();
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 interface ChatMessage {
   id: number;
-  sender: 'user' | 'system';
+  sender: 'user' | 'system' | 'assistant';
   content: string;
   timestamp: Date;
   edited?: boolean;
@@ -14,6 +22,7 @@ class ChatUI {
   private messageIdCounter: number = 0;
   private mode: 'chat' | 'edit' = 'chat';
   private editingMessageId: number | null = null;
+  private currentStreamedContent: string = '';
 
   constructor() {
     this.rl = readline.createInterface({
@@ -25,7 +34,7 @@ class ChatUI {
 
   private initialize(): void {
     console.clear();
-    console.log('チャットを開始します。');
+    console.log('OpenAIチャットを開始します。');
     console.log('コマンド一覧:');
     console.log('/edit [メッセージID] - メッセージを編集');
     console.log('/edit last - 最後のメッセージを編集');
@@ -33,12 +42,15 @@ class ChatUI {
     console.log('Ctrl+D - 終了');
     this.displayPrompt();
 
-    this.rl.on('line', (input: string) => {
+    // システムメッセージを追加
+    this.addMessage('system', 'こんにちは！AIアシスタントです。どのようなお手伝いができますか？');
+
+    this.rl.on('line', async (input: string) => {
       if (input.trim()) {
         if (this.mode === 'edit') {
-          this.handleEditMode(input);
+          await this.handleEditMode(input);
         } else {
-          this.handleChatMode(input);
+          await this.handleChatMode(input);
         }
       }
       this.displayPrompt();
@@ -50,7 +62,7 @@ class ChatUI {
     });
   }
 
-  private handleChatMode(input: string): void {
+  private async handleChatMode(input: string): Promise<void> {
     if (input.startsWith('/edit')) {
       const args = input.split(' ');
       let messageId: number | null = null;
@@ -89,21 +101,99 @@ class ChatUI {
       this.displayChat();
       return;
     } else {
-      // 通常のチャットメッセージを追加
+      // ユーザーメッセージを追加
       this.addMessage('user', input);
-      const response = `Echo: ${input}`;
-      this.addMessage('system', response);
+      
+      try {
+        // OpenAIにストリーミングリクエストを送信
+        const stream = await openai.chat.completions.create({
+          messages: this.messages.map(msg => ({
+            role: msg.sender,
+            content: msg.content
+          })),
+          model: 'gpt-3.5-turbo',
+          stream: true,
+        });
+
+        // 新しいアシスタントメッセージを作成
+        const assistantMessageId = ++this.messageIdCounter;
+        this.currentStreamedContent = '';
+        this.messages.push({
+          id: assistantMessageId,
+          sender: 'assistant',
+          content: '',
+          timestamp: new Date(),
+        });
+
+        // ストリーミングレスポンスを処理
+        for await (const chunk of stream) {
+          const content = chunk.choices[0]?.delta?.content || '';
+          if (content) {
+            this.currentStreamedContent += content;
+            // メッセージを更新
+            const messageIndex = this.messages.findIndex(m => m.id === assistantMessageId);
+            if (messageIndex !== -1) {
+              this.messages[messageIndex].content = this.currentStreamedContent;
+            }
+            // チャット表示を更新
+            this.displayChat();
+          }
+        }
+      } catch (error) {
+        console.error('OpenAIのAPIでエラーが発生しました:', error);
+        this.addMessage('system', 'エラーが発生しました。しばらく待ってから再度お試しください。');
+      }
     }
     this.displayChat();
   }
 
-  private handleEditMode(input: string): void {
+  private async handleEditMode(input: string): Promise<void> {
     if (this.editingMessageId !== null) {
       const messageIndex = this.messages.findIndex(m => m.id === this.editingMessageId);
       if (messageIndex !== -1) {
         this.messages[messageIndex].content = input;
         this.messages[messageIndex].edited = true;
         console.log('メッセージを更新しました。');
+        
+        try {
+          // ストリーミングレスポンスを使用
+          const stream = await openai.chat.completions.create({
+            messages: this.messages.map(msg => ({
+              role: msg.sender,
+              content: msg.content
+            })),
+            model: 'gpt-3.5-turbo',
+            stream: true,
+          });
+
+          // 新しいアシスタントメッセージを作成
+          const assistantMessageId = ++this.messageIdCounter;
+          this.currentStreamedContent = '';
+          this.messages.push({
+            id: assistantMessageId,
+            sender: 'assistant',
+            content: '',
+            timestamp: new Date(),
+          });
+
+          // ストリーミングレスポンスを処理
+          for await (const chunk of stream) {
+            const content = chunk.choices[0]?.delta?.content || '';
+            if (content) {
+              this.currentStreamedContent += content;
+              // メッセージを更新
+              const messageIndex = this.messages.findIndex(m => m.id === assistantMessageId);
+              if (messageIndex !== -1) {
+                this.messages[messageIndex].content = this.currentStreamedContent;
+              }
+              // チャット表示を更新
+              this.displayChat();
+            }
+          }
+        } catch (error) {
+          console.error('OpenAIのAPIでエラーが発生しました:', error);
+          this.addMessage('system', 'エラーが発生しました。しばらく待ってから再度お試しください。');
+        }
       }
     }
     this.mode = 'chat';
@@ -111,7 +201,7 @@ class ChatUI {
     this.displayChat();
   }
 
-  private addMessage(sender: 'user' | 'system', content: string): void {
+  private addMessage(sender: 'user' | 'system' | 'assistant', content: string): void {
     this.messages.push({
       id: ++this.messageIdCounter,
       sender,
@@ -126,12 +216,25 @@ class ChatUI {
     
     this.messages.forEach((msg) => {
       const time = msg.timestamp.toLocaleTimeString();
-      const prefix = msg.sender === 'user' ? '👤 You' : '🤖 Bot';
+      const prefix = this.getSenderPrefix(msg.sender);
       const editedMark = msg.edited ? '(編集済み)' : '';
       console.log(`[${time}] ${prefix} (ID: ${msg.id}): ${msg.content} ${editedMark}`);
     });
     
     console.log('\n==================\n');
+  }
+
+  private getSenderPrefix(sender: 'user' | 'system' | 'assistant'): string {
+    switch (sender) {
+      case 'user':
+        return '👤 You';
+      case 'assistant':
+        return '🤖 AI';
+      case 'system':
+        return '⚙️ System';
+      default:
+        return '';
+    }
   }
 
   private displayPrompt(): void {

@@ -35,7 +35,7 @@ class ChatUI {
   private simulateResponse(): void {
     const response = `あなたのメッセージ "${this.messages[this.messages.length - 1].content}" を受け取りました。`;
     this.messages.push({ role: 'system', content: response });
-    console.log(`システム > ${response}`);
+    console.log(`YUKI.N > ${response}`);
   }
 }
 
